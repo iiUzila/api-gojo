@@ -1,84 +1,101 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
 const app = express();
 
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-let codes = {}; // Memória temporária
+// --- BANCO DE DADOS SIMPLES (ARQUIVO JSON) ---
+const DB_FILE = 'database.json';
+let db = { codes: {}, history: [] };
 
-// --- ROTAS NORMAIS ---
+// Carrega o banco ao iniciar
+if (fs.existsSync(DB_FILE)) {
+    try {
+        db = JSON.parse(fs.readFileSync(DB_FILE));
+        if(!db.history) db.history = []; // Garante que existe
+    } catch(e) { console.log("Erro ao ler DB, criando novo."); }
+}
+
+function saveDB() {
+    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+}
+
+// --- ROTAS ---
+
+app.get("/", (req, res) => res.send("GOJO API (COM HISTÓRICO) 🟢"));
+
 app.post("/start", (req, res) => {
     const { code } = req.body;
     if(!code) return res.status(400).send("No code");
-    codes[code] = { status: "pending", timestamp: Date.now(), id: code };
+    
+    // Salva código temporário
+    db.codes[code] = { status: "pending", timestamp: Date.now() };
     res.send({ ok: true });
 });
 
 app.post("/roblox-verify", (req, res) => {
     const { code, userId, username } = req.body;
-    if (codes[code]) {
-        codes[code] = { ...codes[code], status: "verified", userId, username, verifiedAt: Date.now() };
+    
+    if (db.codes[code]) {
+        // 1. Atualiza o status do código atual
+        db.codes[code] = { ...db.codes[code], status: "verified", userId, username };
+        
+        // 2. SALVA NO HISTÓRICO PERMANENTE (Se ainda não estiver lá)
+        const jaExiste = db.history.find(u => u.userId == userId);
+        
+        const dadosUsuario = {
+            userId,
+            username,
+            lastLogin: Date.now(),
+            avatar: `https://www.roblox.com/headshot-thumbnail/image?userId=${userId}&width=420&height=420&format=png`
+        };
+
+        if (jaExiste) {
+            // Atualiza o último login
+            jaExiste.lastLogin = Date.now();
+            jaExiste.username = username; // Caso tenha mudado de nick
+        } else {
+            // Adiciona novo
+            db.history.push(dadosUsuario);
+        }
+
+        saveDB(); // Salva no arquivo
+        console.log("Usuário registrado/atualizado:", username);
         res.send({ ok: true });
     } else {
-        res.status(404).send({ error: "Invalid code" });
+        res.status(404).send({ error: "Código inválido" });
     }
 });
 
 app.get("/check/:code", (req, res) => {
-    const data = codes[req.params.code];
+    const data = db.codes[req.params.code];
     res.send(data || { status: "not_found" });
 });
 
-// --- ROTAS DE PROXY (Para burlar Vercel) ---
-app.get("/proxy-search", async (req, res) => {
-    try {
-        const r = await fetch(`https://users.roblox.com/v1/users/search?keyword=${req.query.keyword}&limit=100`);
-        const d = await r.json();
-        res.json(d);
-    } catch(e) { res.status(500).json({error: "Erro proxy"}); }
-});
-
-app.get("/proxy-avatar", async (req, res) => {
-    try {
-        const r = await fetch(`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${req.query.userId}&size=150x150&format=Png&isCircular=false`);
-        const d = await r.json();
-        res.json(d);
-    } catch(e) { res.status(500).json({error: "Erro avatar"}); }
-});
-
-// --- 🔥 ROTAS NOVAS DO ADMIN 🔥 ---
-
-// 1. Ver todos os usuários na memória
+// --- ROTA DO ADMIN: RETORNA O HISTÓRICO COMPLETO ---
 app.get("/admin/users", (req, res) => {
-    // Converte o objeto codes em uma lista
-    const list = Object.values(codes).map(c => ({
-        code: c.id,
-        status: c.status,
-        username: c.username || "Esperando...",
-        userId: c.userId || null,
-        time: c.timestamp
-    }));
-    res.json(list);
+    // Retorna a lista de histórico (quem já se registrou)
+    // Ordenado pelo último login (mais recente primeiro)
+    const sorted = db.history.sort((a, b) => b.lastLogin - a.lastLogin);
+    res.json(sorted);
 });
 
-// 2. Chutar um usuário (Deletar da memória)
-app.delete("/admin/kick/:code", (req, res) => {
-    const { code } = req.params;
-    if(codes[code]) {
-        delete codes[code];
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ error: "Não encontrado" });
-    }
+// Deletar usuário do histórico
+app.delete("/admin/kick/:userId", (req, res) => {
+    const { userId } = req.params;
+    db.history = db.history.filter(u => u.userId != userId);
+    saveDB();
+    res.json({ success: true });
 });
 
-app.get("/", (req, res) => res.send("API Online"));
-
-// Limpeza automática (15 min)
+// Limpeza automática só dos códigos temporários (não do histórico)
 setInterval(() => {
     const now = Date.now();
-    for(let c in codes) if(now - codes[c].timestamp > 900000) delete codes[c];
+    for(let c in db.codes) {
+        if(now - db.codes[c].timestamp > 600000) delete db.codes[c];
+    }
 }, 600000);
 
 const port = process.env.PORT || 3000;
